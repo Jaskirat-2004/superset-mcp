@@ -1,116 +1,87 @@
-# Superset MCP Integration
-[![smithery badge](https://smithery.ai/badge/@aptro/superset-mcp)](https://smithery.ai/server/@aptro/superset-mcp)
+# Superset MCP
 
-MCP server for interacting with Apache Superset, enabling AI agents to connect to and control a Superset instance programmatically.
+An MCP server that lets Claude (or any MCP client) work with Apache Superset: list and edit dashboards, charts and datasets, run SQL Lab queries, and manage databases and tags.
 
-## Setup Instructions
+This is a fork of [aptro/superset-mcp](https://github.com/aptro/superset-mcp) with these changes:
 
-### Installing via Smithery
+- **Logs in the way the Superset UI does** (session cookie + CSRF), so it works on instances where the JWT API login is disabled, and falls back to JWT/refresh tokens where it is not.
+- **Logs in automatically** on the first tool call, using the credentials in `.env`.
+- **List tools return everything, not just the first 20 rows.** They walk every page, take `search` / `mine` / `max_results` filters, and report `count`, `returned` and `truncated` so the AI knows when a list was cut short.
+- **Compact chart and dataset rows**, so listing a few thousand charts does not flood the AI's context. Use the `get_by_id` tools for full detail.
 
-To install Superset Integration for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@aptro/superset-mcp):
+## Quick start
+
+You need Python 3.10+, [uv](https://docs.astral.sh/uv/) and a Superset user. Upstream was tested on Superset 4.1.1.
 
 ```bash
-npx -y @smithery/cli install @aptro/superset-mcp --client claude
+git clone https://github.com/Jaskirat-2004/superset-mcp.git
+cd superset-mcp
+uv sync
+cp .env.example .env   # then edit it
 ```
 
-### Manual Installation
+`.env`:
 
-1. **Set Up Superset Locally**
+```
+SUPERSET_BASE_URL=https://your-superset.example.com
+SUPERSET_USERNAME=your_username
+SUPERSET_PASSWORD=your_password
+```
 
-   Run this script to start Superset locally:
-   ```bash
-   git clone --branch 4.1.1 --depth 1 https://github.com/apache/superset && \
-   cd superset && \
-   docker compose -f docker-compose-image-tag.yml up
-   ```
+### Claude Code
 
-   Once Superset is running, you should be able to access it at http://localhost:8088 with default credentials:
-   - Username: admin
-   - Password: admin
+Run from inside the cloned folder:
 
-2. **Clone This Repository**
+```bash
+claude mcp add superset -- uv --directory "$(pwd)" run main.py
+```
 
-   Clone this repository to your local machine.
+Check it with `claude mcp list`, then ask Claude: *"Who am I logged in as in Superset?"*
 
-3. **Configure Environment Variables**
+### Claude Desktop
 
-   Create a `.env` file in the root directory with your Superset credentials:
-   ```
-   SUPERSET_BASE_URL=http://localhost:8088  # Change to your Superset URL
-   SUPERSET_USERNAME=your_username
-   SUPERSET_PASSWORD=your_password
-   ```
+Add this to `claude_desktop_config.json` (use the full path to the folder, and the full path to `uv` if Claude Desktop cannot find it):
 
-4. **Install Dependencies**
+```json
+{
+  "mcpServers": {
+    "superset": {
+      "command": "uv",
+      "args": ["--directory", "/full/path/to/superset-mcp", "run", "main.py"]
+    }
+  }
+}
+```
 
-   ```bash
-   uv pip install .
-   ```
+### No Superset yet?
 
-5. **Install MCP Config for Claude**
+Start one locally with Docker (login `admin` / `admin` at http://localhost:8088):
 
-   To use with Claude Desktop app:
-   ```bash
-   mcp install main.py
-   ```
+```bash
+git clone --branch 4.1.1 --depth 1 https://github.com/apache/superset && \
+cd superset && \
+docker compose -f docker-compose-image-tag.yml up
+```
 
-## Usage with Claude
+## Example requests
 
-After setup, you can interact with your Superset instance via Claude using natural language requests. Here are some examples:
+- "How many dashboards are there, and how many are mine?"
+- "List the charts on dashboard 12"
+- "Find datasets with 'sales' in the name"
+- "Run this SQL on database 1: SELECT COUNT(*) FROM orders"
+- "Create a dashboard titled 'Sales Overview'"
+- "Tag dashboard 3 with 'Finance'"
 
-### Dashboard Management
+## Listing large instances
 
-- **View dashboards**: "Show me all my Superset dashboards"
-- **Get dashboard details**: "Show me the details of dashboard with ID 5"
-- **Create dashboard**: "Create a new dashboard titled 'Sales Overview'"
-- **Update dashboard**: "Update dashboard 3 to have the title 'Updated Sales Report'"
-- **Delete dashboard**: "Delete dashboard with ID 7"
+Every `*_list` tool fetches all pages up to `max_results` (default 500; 50 for query history) and returns:
 
-### Chart Management
-
-- **List all charts**: "What charts do I have in my Superset instance?"
-- **View chart details**: "Show me the details of chart with ID 10"
-- **Create chart**: "Create a new bar chart using dataset 3"
-- **Update chart**: "Update chart 5 to use a line visualization instead of bar"
-- **Delete chart**: "Delete chart with ID 12"
-
-### Database and Dataset Operations
-
-- **List databases**: "Show me all databases connected to Superset"
-- **List datasets**: "What datasets are available in my Superset instance?"
-- **Get database tables**: "What tables are available in database with ID 1?"
-- **Execute SQL**: "Run this SQL query on database 1: SELECT * FROM users LIMIT 10"
-- **Create dataset**: "Create a new dataset from table 'customers' in database 2"
-- **Update database**: "Update the connection settings for database 3"
-- **Delete database**: "Delete database connection with ID 4"
-- **Validate SQL**: "Is this SQL valid for database 2: SELECT * FROM customers JOIN orders"
-- **Get database catalogs**: "Show me the catalogs available in database 1"
-- **Get database functions**: "What functions are available in database 2?"
-- **Check related objects**: "What dashboards and charts use database 1?"
-
-### SQL Lab Features
-
-- **Execute queries**: "Run this SQL query: SELECT COUNT(*) FROM orders"
-- **Format SQL**: "Format this SQL query: SELECT id,name,age FROM users WHERE age>21"
-- **Estimate query cost**: "Estimate the cost of this query: SELECT * FROM large_table"
-- **Get saved queries**: "Show me all my saved SQL queries"
-- **Get query results**: "Get the results of query with key 'abc123'"
-
-### User and System Information
-
-- **View user info**: "Who am I logged in as?"
-- **Get user roles**: "What roles do I have in Superset?"
-- **View recent activity**: "Show me recent activity in my Superset instance"
-- **Get menu data**: "What menu items do I have access to?"
-- **Get base URL**: "What is the URL of the Superset instance I'm connected to?"
-
-### Tag Management
-
-- **List tags**: "Show me all tags in my Superset instance"
-- **Create tag**: "Create a new tag called 'Finance'"
-- **Delete tag**: "Delete the tag with ID 5"
-- **Tag an object**: "Add the tag 'Finance' to dashboard 3"
-- **Remove tag**: "Remove the tag 'Finance' from chart 7"
+| Field | Meaning |
+|-------|---------|
+| `count` | Total rows matching the filters on the server |
+| `returned` | Rows included in this response |
+| `truncated` | `true` when `returned < count`; narrow the filters or raise `max_results` |
+| `result` | The rows |
 
 ## Available MCP Tools
 
@@ -122,21 +93,21 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_auth_authenticate_user` - Authenticate with Superset
 
 ### Dashboards
-- `superset_dashboard_list` - List all dashboards
+- `superset_dashboard_list` - List dashboards (all pages; filter by `search`, `mine`)
 - `superset_dashboard_get_by_id` - Get a specific dashboard
 - `superset_dashboard_create` - Create a new dashboard
 - `superset_dashboard_update` - Update an existing dashboard
 - `superset_dashboard_delete` - Delete a dashboard
 
 ### Charts
-- `superset_chart_list` - List all charts
+- `superset_chart_list` - List charts in compact rows (filter by `search`, `dashboard_id`, `mine`)
 - `superset_chart_get_by_id` - Get a specific chart
 - `superset_chart_create` - Create a new chart
 - `superset_chart_update` - Update an existing chart
 - `superset_chart_delete` - Delete a chart
 
 ### Databases
-- `superset_database_list` - List all databases
+- `superset_database_list` - List database connections (filter by `search`)
 - `superset_database_get_by_id` - Get a specific database
 - `superset_database_create` - Create a new database connection
 - `superset_database_get_tables` - List tables in a database
@@ -152,7 +123,7 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_database_validate_parameters` - Validate database connection parameters
 
 ### Datasets
-- `superset_dataset_list` - List all datasets
+- `superset_dataset_list` - List datasets in compact rows (filter by `search`, `database_id`, `mine`)
 - `superset_dataset_get_by_id` - Get a specific dataset
 - `superset_dataset_create` - Create a new dataset
 
@@ -166,7 +137,7 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_sqllab_get_bootstrap_data` - Get SQL Lab bootstrap data
 
 ### Queries
-- `superset_query_list` - List all queries
+- `superset_query_list` - List SQL Lab query history, newest first
 - `superset_query_get_by_id` - Get a specific query
 - `superset_query_stop` - Stop a running query
 
@@ -186,7 +157,7 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_config_get_base_url` - Get the base URL of the Superset instance
 
 ### Tags
-- `superset_tag_list` - List all tags
+- `superset_tag_list` - List tags
 - `superset_tag_create` - Create a new tag
 - `superset_tag_get_by_id` - Get a specific tag
 - `superset_tag_objects` - Get objects associated with tags
@@ -204,33 +175,27 @@ This plugin offers the following MCP tools that Claude can use:
 - `superset_advanced_data_type_convert` - Convert a value to an advanced data type
 - `superset_advanced_data_type_list` - List available advanced data types
 
-## Environment Variables
+## Environment variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| SUPERSET_BASE_URL | URL of your Superset instance | http://localhost:8088 |
-| SUPERSET_USERNAME | Username for Superset | None |
-| SUPERSET_PASSWORD | Password for Superset | None |
+| `SUPERSET_BASE_URL` | URL of your Superset instance | `http://localhost:8088` |
+| `SUPERSET_USERNAME` | Superset username | none |
+| `SUPERSET_PASSWORD` | Superset password | none |
 
 ## Troubleshooting
 
-- If you encounter authentication issues, verify your credentials in the `.env` file
-- Make sure Superset is running and accessible at the URL specified in your `.env` file
-- Check that you're using a compatible version of Superset (tested with version 4.1.1)
-- Ensure the port used by the MCP server is not being used by another application
+- **"Not authenticated"**: check `SUPERSET_USERNAME` / `SUPERSET_PASSWORD` in `.env`, and that you can log in to the Superset UI with them.
+- **Server does not start in Claude**: run `uv --directory /path/to/superset-mcp run main.py` in a terminal to see the error; Claude may also need the full path to `uv` (`which uv`).
+- **A list looks short**: check `truncated` in the response and raise `max_results`.
 
-## Security Notes
+## Security notes
 
-- Your Superset credentials are stored only in your local `.env` file
-- The access token is stored in `.superset_token` file in the project directory
-- All authentication happens directly between the MCP server and your Superset instance
-- No credentials are transmitted to Claude or any third parties
-- For production use, consider using more secure authentication methods
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+- Credentials live only in your local `.env`, which is gitignored.
+- If JWT login is used, tokens are cached in `.superset_token` and `.superset_refresh_token` in the project folder; both are gitignored.
+- The server talks only to your Superset instance. Anything a tool returns is shown to the AI client you use.
+- Write tools (create, update, delete, SQL execution) act with your Superset permissions. Use a user whose rights match what you want the AI to be able to do.
 
 ## License
 
-MIT
+MIT, as upstream.

@@ -167,14 +167,19 @@ R = TypeVar("R")
 def requires_auth(
     func: Callable[..., Awaitable[Dict[str, Any]]],
 ) -> Callable[..., Awaitable[Dict[str, Any]]]:
-    """Decorator to check authentication before executing a function"""
+    """Decorator that logs in with the .env credentials on first use"""
 
     @wraps(func)
     async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
         superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
         if not superset_ctx.access_token:
-            return {"error": "Not authenticated. Please authenticate first."}
+            login = await superset_auth_authenticate_user(ctx)
+            if not superset_ctx.access_token:
+                return {
+                    "error": "Not authenticated: "
+                    + str(login.get("error", "check SUPERSET_USERNAME/PASSWORD in .env"))
+                }
 
         return await func(ctx, *args, **kwargs)
 
@@ -344,6 +349,83 @@ async def make_api_request(
         }
 
     return response.json()
+
+
+async def list_all(
+    ctx: Context,
+    endpoint: str,
+    filters: Optional[List[Dict[str, Any]]] = None,
+    columns: Optional[List[str]] = None,
+    max_results: int = 500,
+    order_column: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch every page of a Superset list endpoint, up to max_results rows.
+
+    Superset list endpoints return 20 rows by default and at most 100 per page,
+    so a single request silently hides the rest. This walks the pages and
+    reports whether the result was cut short.
+    """
+    page_size = 100
+    rows: List[Dict[str, Any]] = []
+    total = 0
+    page = 0
+    while len(rows) < max_results:
+        q: Dict[str, Any] = {"page": page, "page_size": page_size}
+        if filters:
+            q["filters"] = filters
+        if columns:
+            q["columns"] = columns
+        if order_column:
+            q["order_column"] = order_column
+            q["order_direction"] = "desc"
+        result = await make_api_request(
+            ctx, "get", endpoint, params={"q": json.dumps(q)}
+        )
+        if result.get("error"):
+            return result
+        batch = result.get("result", [])
+        total = result.get("count", len(batch))
+        rows.extend(batch)
+        if len(batch) < page_size or len(rows) >= total:
+            break
+        page += 1
+
+    rows = rows[:max_results]
+    response: Dict[str, Any] = {
+        "count": total,
+        "returned": len(rows),
+        "truncated": len(rows) < total,
+        "result": rows,
+    }
+    if response["truncated"]:
+        response["hint"] = (
+            f"Showing {len(rows)} of {total}. Narrow with search/filters "
+            "or raise max_results."
+        )
+    return response
+
+
+async def current_user_id(ctx: Context) -> Optional[int]:
+    """Return the logged-in user's id, or None if it cannot be determined."""
+    me = await superset_user_get_current(ctx)
+    for value in (me.get("result", {}).get("id"), me.get("user_id")):
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+async def owner_filter(ctx: Context, mine: bool) -> List[Dict[str, Any]]:
+    """Build the owners filter used by the `mine` option of list tools."""
+    if not mine:
+        return []
+    user_id = await current_user_id(ctx)
+    if user_id is None:
+        raise ValueError("Could not determine the current user for mine=True")
+    return [{"col": "owners", "opr": "rel_m_m", "value": user_id}]
 
 
 # ===== Authentication Tools =====
@@ -530,14 +612,29 @@ async def superset_auth_authenticate_user(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dashboard_list(
+    ctx: Context,
+    search: Optional[str] = None,
+    mine: bool = False,
+    max_results: int = 500,
+) -> Dict[str, Any]:
     """
-    Get a list of ALL dashboards from Superset including drafts
+    List dashboards, including drafts, across every page of results
+
+    Args:
+        search: Only dashboards whose title contains this text (case-insensitive)
+        mine: Only dashboards owned by the logged-in user
+        max_results: Stop after this many rows (default 500)
 
     Returns:
-        A dictionary containing all dashboard data
+        count (total matching), returned, truncated, and the dashboard rows
     """
-    return await make_api_request(ctx, "get", "/api/v1/dashboard/")
+    filters = await owner_filter(ctx, mine)
+    if search:
+        filters.append({"col": "dashboard_title", "opr": "ct", "value": search})
+    return await list_all(
+        ctx, "/api/v1/dashboard/", filters=filters, max_results=max_results
+    )
 
 
 @mcp.tool()
@@ -644,23 +741,50 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_chart_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
+async def superset_chart_list(
+    ctx: Context,
+    search: Optional[str] = None,
+    dashboard_id: Optional[int] = None,
+    mine: bool = False,
+    max_results: int = 500,
+) -> Dict[str, Any]:
     """
-    Get a list of charts from Superset
+    List charts across every page of results, one compact row per chart
 
-    Makes a request to the /api/v1/chart/ endpoint to retrieve all charts
-    the current user has access to view. Results are paginated.
+    Rows hold id, name, viz type, dataset, owners and dashboards. Use
+    superset_chart_get_by_id for a chart's full definition.
 
     Args:
-        page_size: Number of results per page (default 100, max 100)
-        page: Page number to retrieve (0-indexed, default 0)
+        search: Only charts whose name contains this text (case-insensitive)
+        dashboard_id: Only charts on this dashboard
+        mine: Only charts owned by the logged-in user
+        max_results: Stop after this many rows (default 500)
 
     Returns:
-        A dictionary containing chart data including id, slice_name, viz_type, and datasource info
+        count (total matching), returned, truncated, and the chart rows
     """
-    import json as _json
-    q = _json.dumps({"page_size": page_size, "page": page})
-    return await make_api_request(ctx, "get", "/api/v1/chart/", params={"q": q})
+    filters = await owner_filter(ctx, mine)
+    if search:
+        filters.append({"col": "slice_name", "opr": "ct", "value": search})
+    if dashboard_id is not None:
+        filters.append({"col": "dashboards", "opr": "rel_m_m", "value": dashboard_id})
+    columns = [
+        "id",
+        "slice_name",
+        "viz_type",
+        "datasource_id",
+        "datasource_type",
+        "datasource_name_text",
+        "changed_on_delta_humanized",
+        "owners.id",
+        "owners.first_name",
+        "owners.last_name",
+        "dashboards.id",
+        "dashboards.dashboard_title",
+    ]
+    return await list_all(
+        ctx, "/api/v1/chart/", filters=filters, columns=columns, max_results=max_results
+    )
 
 
 @mcp.tool()
@@ -771,23 +895,27 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_database_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
+async def superset_database_list(
+    ctx: Context,
+    search: Optional[str] = None,
+    max_results: int = 500,
+) -> Dict[str, Any]:
     """
-    Get a list of databases from Superset
-
-    Makes a request to the /api/v1/database/ endpoint to retrieve all database
-    connections the current user has access to. Results are paginated.
+    List database connections across every page of results
 
     Args:
-        page_size: Number of results per page (default 100, max 100)
-        page: Page number to retrieve (0-indexed, default 0)
+        search: Only databases whose name contains this text (case-insensitive)
+        max_results: Stop after this many rows (default 500)
 
     Returns:
-        A dictionary containing database connection information including id, name, and configuration
+        count (total matching), returned, truncated, and the database rows
     """
-    import json as _json
-    q = _json.dumps({"page_size": page_size, "page": page})
-    return await make_api_request(ctx, "get", "/api/v1/database/", params={"q": q})
+    filters = []
+    if search:
+        filters.append({"col": "database_name", "opr": "ct", "value": search})
+    return await list_all(
+        ctx, "/api/v1/database/", filters=filters, max_results=max_results
+    )
 
 
 @mcp.tool()
@@ -1123,23 +1251,48 @@ async def superset_database_validate_parameters(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dataset_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
+async def superset_dataset_list(
+    ctx: Context,
+    search: Optional[str] = None,
+    database_id: Optional[int] = None,
+    mine: bool = False,
+    max_results: int = 500,
+) -> Dict[str, Any]:
     """
-    Get a list of datasets from Superset
+    List datasets across every page of results, one compact row per dataset
 
-    Makes a request to the /api/v1/dataset/ endpoint to retrieve all datasets
-    the current user has access to view. Results are paginated.
+    Rows hold id, table name, schema, database and owners. Use
+    superset_dataset_get_by_id for columns and metrics.
 
     Args:
-        page_size: Number of results per page (default 100, max 100)
-        page: Page number to retrieve (0-indexed, default 0)
+        search: Only datasets whose table name contains this text (case-insensitive)
+        database_id: Only datasets on this database
+        mine: Only datasets owned by the logged-in user
+        max_results: Stop after this many rows (default 500)
 
     Returns:
-        A dictionary containing dataset information including id, table_name, and database
+        count (total matching), returned, truncated, and the dataset rows
     """
-    import json as _json
-    q = _json.dumps({"page_size": page_size, "page": page})
-    return await make_api_request(ctx, "get", "/api/v1/dataset/", params={"q": q})
+    filters = await owner_filter(ctx, mine)
+    if search:
+        filters.append({"col": "table_name", "opr": "ct", "value": search})
+    if database_id is not None:
+        filters.append({"col": "database", "opr": "rel_o_m", "value": database_id})
+    columns = [
+        "id",
+        "table_name",
+        "schema",
+        "kind",
+        "database.id",
+        "database.database_name",
+        "changed_on_delta_humanized",
+        "owners.id",
+        "owners.first_name",
+        "owners.last_name",
+    ]
+    return await list_all(
+        ctx, "/api/v1/dataset/", filters=filters, columns=columns, max_results=max_results
+    )
 
 
 @mcp.tool()
@@ -1453,17 +1606,22 @@ async def superset_query_stop(ctx: Context, client_id: str) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_query_list(ctx: Context) -> Dict[str, Any]:
+async def superset_query_list(ctx: Context, max_results: int = 50) -> Dict[str, Any]:
     """
-    Get a list of queries from Superset
+    List SQL Lab query history, most recent first
 
-    Makes a request to the /api/v1/query/ endpoint to retrieve query history.
-    Results are paginated and include both finished and running queries.
+    History can run to hundreds of thousands of rows, so only the newest
+    max_results are returned.
+
+    Args:
+        max_results: Stop after this many rows (default 50)
 
     Returns:
-        A dictionary containing query information including status, duration, and SQL
+        count (total in history), returned, truncated, and the query rows
     """
-    return await make_api_request(ctx, "get", "/api/v1/query/")
+    return await list_all(
+        ctx, "/api/v1/query/", max_results=max_results, order_column="changed_on"
+    )
 
 
 @mcp.tool()
@@ -1591,17 +1749,17 @@ async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_tag_list(ctx: Context) -> Dict[str, Any]:
+async def superset_tag_list(ctx: Context, max_results: int = 500) -> Dict[str, Any]:
     """
-    Get a list of tags from Superset
+    List tags across every page of results
 
-    Makes a request to the /api/v1/tag/ endpoint to retrieve all tags
-    defined in the Superset instance.
+    Args:
+        max_results: Stop after this many rows (default 500)
 
     Returns:
-        A dictionary containing tag information including id and name
+        count (total), returned, truncated, and the tag rows
     """
-    return await make_api_request(ctx, "get", "/api/v1/tag/")
+    return await list_all(ctx, "/api/v1/tag/", max_results=max_results)
 
 
 @mcp.tool()
