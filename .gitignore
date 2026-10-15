@@ -11,3 +11,12 @@ wheels/
 
 .env
 .superset_token
+# ── Local working docs: never commit ─────────────────────────────────────────
+work/
+scratchpad/
+.superset_token
+.superset_refresh_token
+
+# ── Local-only until scrubbed of client details ──────────────────────────────
+scripts/
+.claude/

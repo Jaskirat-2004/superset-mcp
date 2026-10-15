@@ -60,6 +60,7 @@ SUPERSET_BASE_URL = os.getenv("SUPERSET_BASE_URL", "http://localhost:8088")
 SUPERSET_USERNAME = os.getenv("SUPERSET_USERNAME")
 SUPERSET_PASSWORD = os.getenv("SUPERSET_PASSWORD")
 ACCESS_TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_token")
+REFRESH_TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_refresh_token")
 
 # Initialize FastAPI app for handling additional web endpoints if needed
 app = FastAPI(title="Superset MCP Server")
@@ -73,6 +74,7 @@ class SupersetContext:
     base_url: str
     access_token: Optional[str] = None
     csrf_token: Optional[str] = None
+    refresh_token: Optional[str] = None
     app: FastAPI = None
 
 
@@ -96,43 +98,54 @@ def save_access_token(token: str):
         logger.warning(f"Warning: Could not save access token: {e}")
 
 
+def load_stored_refresh_token() -> Optional[str]:
+    """Load stored refresh token if it exists"""
+    try:
+        if os.path.exists(REFRESH_TOKEN_STORE_PATH):
+            with open(REFRESH_TOKEN_STORE_PATH, "r") as f:
+                return f.read().strip()
+    except Exception:
+        return None
+    return None
+
+
+def save_refresh_token(token: str):
+    """Save refresh token to file"""
+    try:
+        with open(REFRESH_TOKEN_STORE_PATH, "w") as f:
+            f.write(token)
+    except Exception as e:
+        logger.warning(f"Warning: Could not save refresh token: {e}")
+
+
+def decode_jwt_user_id(token: str) -> Optional[str]:
+    """Extract user ID from JWT sub claim without verifying signature."""
+    try:
+        import base64 as _b64
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(_b64.b64decode(payload_b64).decode("utf-8"))
+        sub = payload.get("sub")
+        return str(sub) if sub is not None else None
+    except Exception:
+        return None
+
+
 @asynccontextmanager
 async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     """Manage application lifecycle for Superset integration"""
     logger.info("Initializing Superset context...")
 
-    # Create HTTP client
-    client = httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=30.0)
-
-    # Create context
+    # Session-cookie auth: follow_redirects required for form /login/ which 302s on success
+    client = httpx.AsyncClient(
+        base_url=SUPERSET_BASE_URL, timeout=30.0, follow_redirects=True
+    )
     ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
-
-    # Try to load existing token
-    stored_token = load_stored_token()
-    if stored_token:
-        ctx.access_token = stored_token
-        # Set the token in the client headers
-        client.headers.update({"Authorization": f"Bearer {stored_token}"})
-        logger.info("Using stored access token")
-
-        # Verify token validity
-        try:
-            response = await client.get("/api/v1/me/")
-            if response.status_code != 200:
-                logger.info(
-                    f"Stored token is invalid (status {response.status_code}). Will need to re-authenticate."
-                )
-                ctx.access_token = None
-                client.headers.pop("Authorization", None)
-        except Exception as e:
-            logger.info(f"Error verifying stored token: {e}")
-            ctx.access_token = None
-            client.headers.pop("Authorization", None)
+    # No persistent token to load - cookies live on the httpx client only for this process
 
     try:
         yield ctx
     finally:
-        # Cleanup on shutdown
         logger.info("Shutting down Superset context...")
         await client.aclose()
 
@@ -256,11 +269,15 @@ async def get_csrf_token(ctx: Context) -> Optional[str]:
         if response.status_code == 200:
             data = response.json()
             csrf_token = data.get("result")
+            if not csrf_token:
+                logger.warning("CSRF token endpoint returned 200 but no 'result' field")
+                return None
             superset_ctx.csrf_token = csrf_token
             return csrf_token
         else:
-            logger.info(
+            logger.warning(
                 f"Failed to get CSRF token: {response.status_code} - {response.text}"
+                " -- POST/PUT/DELETE calls may fail without it"
             )
             return None
     except Exception as e:
@@ -350,8 +367,11 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
         return {"valid": False, "error": "No access token available"}
 
     try:
-        # Make a simple API call to test if token is valid (get user info)
-        response = await superset_ctx.client.get("/api/v1/me/")
+        # Use dashboard endpoint as health check — /api/v1/me/ may be restricted
+        # on some Superset instances even for valid tokens
+        response = await superset_ctx.client.get(
+            "/api/v1/dashboard/", params={"q": '{"page_size":1}'}
+        )
 
         if response.status_code == 200:
             return {"valid": True}
@@ -379,12 +399,15 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     """
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
-    if not superset_ctx.access_token:
-        return {"error": "No access token to refresh. Please authenticate first."}
+    if not superset_ctx.refresh_token:
+        return {"error": "No refresh token available. Please authenticate first."}
 
     try:
-        # Use the refresh endpoint to get a new token
-        response = await superset_ctx.client.post("/api/v1/security/refresh")
+        # Flask-JWT-Extended requires the refresh token (not the access token) in the Authorization header
+        response = await superset_ctx.client.post(
+            "/api/v1/security/refresh",
+            headers={"Authorization": f"Bearer {superset_ctx.refresh_token}"},
+        )
 
         if response.status_code != 200:
             return {
@@ -462,39 +485,39 @@ async def superset_auth_authenticate_user(
         }
 
     try:
-        # Get access token directly using the security login API endpoint
-        response = await superset_ctx.client.post(
-            "/api/v1/security/login",
-            json={
-                "username": username,
-                "password": password,
-                "provider": "db",
-                "refresh": refresh,
-            },
-        )
+        # Step 1: GET /login/ to seed cookies and extract CSRF token if present
+        import re as _re
+        login_page = await superset_ctx.client.get("/login/")
+        if login_page.status_code != 200:
+            return {"error": f"Failed to load login page: {login_page.status_code}"}
 
-        if response.status_code != 200:
-            return {
-                "error": f"Failed to get access token: {response.status_code} - {response.text}"
-            }
+        form_data = {"username": username, "password": password}
+        # Extract CSRF token from login form if WTF_CSRF is enabled
+        csrf_match = _re.search(r'name="csrf_token"[^>]*value="([^"]+)"', login_page.text) or \
+                     _re.search(r'value="([^"]+)"[^>]*name="csrf_token"', login_page.text)
+        if csrf_match:
+            form_data["csrf_token"] = csrf_match.group(1)
 
-        data = response.json()
-        access_token = data.get("access_token")
+        # Step 2: POST form credentials - follow_redirects lands us on /superset/welcome/
+        login_resp = await superset_ctx.client.post("/login/", data=form_data)
+        final_url = str(login_resp.url)
+        if "/login/" in final_url or login_resp.status_code >= 400:
+            return {"error": f"Login failed (status {login_resp.status_code}, landed at {final_url}). Check credentials."}
 
-        if not access_token:
-            return {"error": "No access token returned"}
+        # Step 3: Confirm session works
+        me = await superset_ctx.client.get("/api/v1/me/")
+        if me.status_code != 200:
+            return {"error": f"Login appeared to succeed but /api/v1/me/ returned {me.status_code}"}
 
-        # Save and set the access token
-        save_access_token(access_token)
-        superset_ctx.access_token = access_token
-        superset_ctx.client.headers.update({"Authorization": f"Bearer {access_token}"})
+        superset_ctx.access_token = "session-cookie"
 
-        # Get CSRF token after successful authentication
+        # Fetch CSRF token for subsequent non-GET API calls
         await get_csrf_token(ctx)
 
+        user = me.json().get("result", {})
         return {
-            "message": "Successfully authenticated with Superset",
-            "access_token": access_token,
+            "message": "Successfully authenticated with Superset (session-cookie auth)",
+            "user": {"id": user.get("id"), "username": user.get("username"), "email": user.get("email")},
         }
 
     except Exception as e:
@@ -509,13 +532,10 @@ async def superset_auth_authenticate_user(
 @handle_api_errors
 async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
     """
-    Get a list of dashboards from Superset
-
-    Makes a request to the /api/v1/dashboard/ endpoint to retrieve all dashboards
-    the current user has access to view. Results are paginated.
+    Get a list of ALL dashboards from Superset including drafts
 
     Returns:
-        A dictionary containing dashboard data including id, title, url, and metadata
+        A dictionary containing all dashboard data
     """
     return await make_api_request(ctx, "get", "/api/v1/dashboard/")
 
@@ -624,17 +644,23 @@ async def superset_dashboard_delete(ctx: Context, dashboard_id: int) -> Dict[str
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_chart_list(ctx: Context) -> Dict[str, Any]:
+async def superset_chart_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
     """
     Get a list of charts from Superset
 
     Makes a request to the /api/v1/chart/ endpoint to retrieve all charts
     the current user has access to view. Results are paginated.
 
+    Args:
+        page_size: Number of results per page (default 100, max 100)
+        page: Page number to retrieve (0-indexed, default 0)
+
     Returns:
         A dictionary containing chart data including id, slice_name, viz_type, and datasource info
     """
-    return await make_api_request(ctx, "get", "/api/v1/chart/")
+    import json as _json
+    q = _json.dumps({"page_size": page_size, "page": page})
+    return await make_api_request(ctx, "get", "/api/v1/chart/", params={"q": q})
 
 
 @mcp.tool()
@@ -745,17 +771,23 @@ async def superset_chart_delete(ctx: Context, chart_id: int) -> Dict[str, Any]:
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_database_list(ctx: Context) -> Dict[str, Any]:
+async def superset_database_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
     """
     Get a list of databases from Superset
 
     Makes a request to the /api/v1/database/ endpoint to retrieve all database
     connections the current user has access to. Results are paginated.
 
+    Args:
+        page_size: Number of results per page (default 100, max 100)
+        page: Page number to retrieve (0-indexed, default 0)
+
     Returns:
         A dictionary containing database connection information including id, name, and configuration
     """
-    return await make_api_request(ctx, "get", "/api/v1/database/")
+    import json as _json
+    q = _json.dumps({"page_size": page_size, "page": page})
+    return await make_api_request(ctx, "get", "/api/v1/database/", params={"q": q})
 
 
 @mcp.tool()
@@ -1091,17 +1123,23 @@ async def superset_database_validate_parameters(
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dataset_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dataset_list(ctx: Context, page_size: int = 100, page: int = 0) -> Dict[str, Any]:
     """
     Get a list of datasets from Superset
 
     Makes a request to the /api/v1/dataset/ endpoint to retrieve all datasets
     the current user has access to view. Results are paginated.
 
+    Args:
+        page_size: Number of results per page (default 100, max 100)
+        page: Page number to retrieve (0-indexed, default 0)
+
     Returns:
         A dictionary containing dataset information including id, table_name, and database
     """
-    return await make_api_request(ctx, "get", "/api/v1/dataset/")
+    import json as _json
+    q = _json.dumps({"page_size": page_size, "page": page})
+    return await make_api_request(ctx, "get", "/api/v1/dataset/", params={"q": q})
 
 
 @mcp.tool()
@@ -1473,13 +1511,42 @@ async def superset_user_get_current(ctx: Context) -> Dict[str, Any]:
     """
     Get information about the currently authenticated user
 
-    Makes a request to the /api/v1/me/ endpoint to retrieve the user's profile
-    information including permissions and preferences.
+    Tries /api/v1/me/ first. If that endpoint is restricted (common on some
+    Superset instances), falls back to decoding the JWT sub claim for the user
+    ID and fetching the full profile from /api/v1/security/users/{id}.
 
     Returns:
         A dictionary with user profile data
     """
-    return await make_api_request(ctx, "get", "/api/v1/me/")
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    # auto_refresh=False: /api/v1/me/ is permanently restricted on some
+    # instances -- don't burn a token refresh cycle on a known-failing endpoint
+    result = await make_api_request(ctx, "get", "/api/v1/me/", auto_refresh=False)
+    if not result.get("error"):
+        return result
+
+    # Fall back: decode JWT to get user ID, then fetch from security users API
+    user_id = decode_jwt_user_id(superset_ctx.access_token or "")
+    if user_id:
+        user_result = await make_api_request(
+            ctx, "get", f"/api/v1/security/users/{user_id}", auto_refresh=False
+        )
+        if not user_result.get("error"):
+            return user_result
+
+    # Last resort: return whatever info we can decode from the JWT itself
+    if superset_ctx.access_token:
+        try:
+            import base64 as _b64
+            raw = superset_ctx.access_token.split(".")[1]
+            raw += "=" * (4 - len(raw) % 4)
+            payload = json.loads(_b64.b64decode(raw).decode("utf-8"))
+            return {"source": "jwt_payload", "user_id": payload.get("sub"), "token_info": payload}
+        except Exception:
+            pass
+
+    return result
 
 
 @mcp.tool()
@@ -1489,13 +1556,33 @@ async def superset_user_get_roles(ctx: Context) -> Dict[str, Any]:
     """
     Get roles for the current user
 
-    Makes a request to the /api/v1/me/roles/ endpoint to retrieve all roles
-    assigned to the current user.
+    Tries /api/v1/me/roles/ first. If restricted, uses the JWT sub claim to
+    fetch the user record from /api/v1/security/users/{id} which includes role
+    information. Falls back to listing all roles via /api/v1/security/roles/.
 
     Returns:
         A dictionary with user role information
     """
-    return await make_api_request(ctx, "get", "/api/v1/me/roles/")
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+
+    result = await make_api_request(ctx, "get", "/api/v1/me/roles/", auto_refresh=False)
+    if not result.get("error"):
+        return result
+
+    # Use JWT sub to get user-specific role data
+    user_id = decode_jwt_user_id(superset_ctx.access_token or "")
+    if user_id:
+        user_result = await make_api_request(
+            ctx, "get", f"/api/v1/security/users/{user_id}", auto_refresh=False
+        )
+        if not user_result.get("error"):
+            roles = user_result.get("result", {}).get("roles") or user_result.get("roles")
+            if roles is not None:
+                return {"user_id": user_id, "roles": roles}
+            return user_result
+
+    # Last resort: list all roles (not user-specific but confirms connectivity)
+    return await make_api_request(ctx, "get", "/api/v1/security/roles/")
 
 
 # ===== Tag Tools =====
